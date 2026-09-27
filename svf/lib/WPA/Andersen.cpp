@@ -32,9 +32,16 @@
 #include "WPA/Andersen.h"
 #include "WPA/Steensgaard.h"
 #include "WPA/WPAStat.h"
+#include "Util/CoreBitVector.h"
 #include "Util/GeneralType.h"
 #include "Util/Options.h"
 #include "Util/SVFUtil.h"
+
+#include <utility>
+
+#include <algorithm>
+#include <cstdint>
+#include <vector>
 
 using namespace SVF;
 using namespace SVFUtil;
@@ -181,7 +188,10 @@ void AndersenBase:: solveAndwritePtsToFile(const std::string& filename)
 
 void AndersenBase::cleanConsCG(NodeID id)
 {
-    consCG->resetSubs(consCG->getRep(id));
+    // Remove only this node from its representative's members. Erasing the whole
+    // member set would leave every other member mapped to a representative that no
+    // longer lists it, so sccSubNodes would stop being the inverse of sccRepNode.
+    consCG->getSubs(consCG->sccRepNode(id)).reset(id);
     for (NodeID sub: consCG->getSubs(id))
         consCG->resetRep(sub);
     consCG->resetSubs(id);
@@ -722,6 +732,11 @@ void Andersen::mergeSccCycle()
         const NodeBS& subNodes = getSCCDetector()->subNodes(repNodeId);
         // merge sub nodes to rep node
         mergeSccNodes(repNodeId, subNodes);
+        if (subNodes.count() > 1)
+        {
+            pushIntoWorklist(repNodeId);
+            reanalyze = true;
+        }
     }
 }
 
@@ -909,6 +924,144 @@ void Andersen::updateNodeRepAndSubs(NodeID nodeId, NodeID newRepId)
     consCG->resetSubs(nodeId);
 }
 
+/*!
+ * Collect every SVFIR node that may alias the given node.
+ */
+NodeBS Andersen::getMayAliases(NodeID node)
+{
+    // Reuse this expansion for the index lookup and, when necessary, every
+    // comparison in the exhaustive fallback.
+    PointsTo expandedPts;
+    expandFIObjs(getPts(node), expandedPts);
+    if (auto aliases = collectMayAliasesFromIndex(expandedPts))
+        return std::move(*aliases);
+
+    NodeBS aliases;
+    const bool queryPointsToBlackHole = containBlackHoleNode(expandedPts);
+    for (SVFIR::iterator it = pag->begin(), eit = pag->end(); it != eit; ++it)
+    {
+        const NodeID candidate = it->first;
+        if (queryPointsToBlackHole)
+        {
+            aliases.set(candidate);
+            continue;
+        }
+
+        PointsTo candidatePts;
+        expandFIObjs(getPts(candidate), candidatePts);
+        if (containBlackHoleNode(candidatePts) ||
+                expandedPts.intersects(candidatePts))
+            aliases.set(candidate);
+    }
+    return aliases;
+}
+
+/*!
+ * Answer a may-alias query from the reverse points-to sets, which say which nodes
+ * may point to a given object.
+ *
+ * Two nodes may alias exactly when their expanded points-to sets share an object.
+ * For every object in this query's expanded set, collect all raw points-to objects
+ * whose expansion can contain it: the object itself, its base, and every field of
+ * a field-insensitive base. The reverse sets of those objects therefore name the
+ * complete answer. The black-hole reverse set supplies nodes that alias everything.
+ *
+ * Returns nullopt when reverse points-to sets are unavailable or the query itself
+ * points to the black hole, leaving the caller to try every node.
+ */
+std::optional<NodeBS> Andersen::collectMayAliasesFromIndex(const PointsTo& expandedPts)
+{
+    if (!getPTDataTy()->hasReversePts() || containBlackHoleNode(expandedPts))
+        return std::nullopt;
+
+    NodeBS objects;
+    const u32_t nodeBound = pag->getTotalNodeNum();
+    for (NodeID object : expandedPts)
+    {
+        objects.set(object);
+        const NodeID base = pag->getBaseObjVarID(object);
+        objects.set(base);
+        if (isFieldInsensitive(base))
+            objects |= pag->getAllFieldsObjVars(base);
+    }
+    objects.set(pag->getBlackHoleNode());
+
+    const size_t wordCount = (static_cast<size_t>(nodeBound) +
+                              CoreBitVector::WordSize - 1) / CoreBitVector::WordSize;
+    CoreBitVector representatives(wordCount);
+    for (NodeID object : objects)
+    {
+        for (NodeID key : getRevPts(object))
+        {
+            const NodeID representative = sccRepNode(key);
+            // Reverse points-to sets can retain stale postings. Confirm the
+            // posting with one current-set bit test before treating it as an
+            // alias witness, unless an earlier object already confirmed it.
+            if (!representatives.test(representative) &&
+                    getPts(representative).test(object))
+                representatives.set(representative);
+        }
+    }
+
+    // SCC subnode sets are individually ordered, but their concatenation is
+    // not globally ordered. Collect them densely before inserting into the
+    // sparse result, where backward insertions would be costly.
+    CoreBitVector answer(wordCount);
+    for (NodeID representative : representatives)
+    {
+        for (NodeID subNode : sccSubNodes(representative))
+            answer.set(subNode);
+    }
+
+    // normalizePointsTo can remove field nodes while their ids remain in
+    // points-to sets. Do not return those stale nodes.
+    NodeBS aliases;
+    for (NodeID id : answer)
+    {
+        if (pag->hasGNode(id))
+            aliases.set(id);
+    }
+    return aliases;
+}
+
+/*!
+ * Run the alias tests, then check getMayAliases on every pointer they use: it must
+ * return exactly the nodes that mayAlias reports
+ */
+void Andersen::validateSuccessTests(std::string fun)
+{
+    AndersenBase::validateSuccessTests(fun);
+
+    PointerAnalysis* pta = this;
+    const FunObjVar* checkFun = pag->getFunObjVar(fun);
+    if (!checkFun)
+        return;
+    for (const CallICFGNode* callNode : pag->getCallSiteSet())
+    {
+        if (callNode->getCalledFunction() != checkFun)
+            continue;
+        for (u32_t i = 0; i < callNode->arg_size(); ++i)
+        {
+            NodeID ptr = callNode->getArgument(i)->getId();
+            NodeBS expected;
+            for (SVFIR::iterator it = pag->begin(), eit = pag->end(); it != eit; ++it)
+            {
+                if (mayAlias(ptr, it->first))
+                    expected.set(it->first);
+            }
+            if (pta->getMayAliases(ptr) == expected)
+                outs() << sucMsg("\t SUCCESS :") << "getMayAliases check <id:" << ptr << "> at ("
+                       << callNode->getSourceLoc() << ")\n";
+            else
+            {
+                SVFUtil::errs() << errMsg("\t FAILURE :") << "getMayAliases check <id:" << ptr
+                                << "> at (" << callNode->getSourceLoc() << ")\n";
+                assert(false && "getMayAliases disagrees with mayAlias!");
+            }
+        }
+    }
+}
+
 void Andersen::cluster(void) const
 {
     assert(Options::MaxFieldLimit() == 0 && "Andersen::cluster: clustering for Andersen's is currently only supported in field-insensitive analysis");
@@ -975,4 +1128,3 @@ void Andersen::dumpTopLevelPtsTo()
 
     outs().flush();
 }
-

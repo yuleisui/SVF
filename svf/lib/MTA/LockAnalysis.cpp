@@ -30,33 +30,37 @@
 #include "Util/Options.h"
 #include "MTA/LockAnalysis.h"
 #include "MTA/MTA.h"
+#include "MTA/MTASlicer.h"
 #include "Util/SVFUtil.h"
 #include "Util/PTAStat.h"
-
+#include "Graphs/ThreadCallGraph.h"
+#include "SVFIR/SVFIR.h"
+#include "Graphs/SlicedGraphs.h"
 
 using namespace SVF;
 using namespace SVFUtil;
 
 
-void LockAnalysis::analyze()
-{
 
-    collectLockUnlocksites();
-    buildCandidateFuncSetforLock();
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::analyze(ICFGGraph icfg, CGGraph cg)
+{
+    collectLockUnlockSites(icfg, cg);
+    buildCandidateFuncSetForLock(cg);
 
     DOTIMESTAT(double lockStart = PTAStat::getClk(true));
 
     DBOUT(DGENERAL, outs() << "\tIntra-procedural LockAnalysis\n");
     DBOUT(DMTA, outs() << "\tIntra-procedural LockAnalysis\n");
-    analyzeIntraProcedualLock();
+    analyzeIntraProceduralLock(icfg);
 
     DBOUT(DGENERAL, outs() << "\tCollect context-sensitive locks\n");
     DBOUT(DMTA, outs() << "\tCollect context-sensitive locks\n");
-    collectCxtLock();
+    collectCxtLock(icfg, cg);
 
     DBOUT(DGENERAL, outs() << "\tInter-procedural LockAnalysis\n");
     DBOUT(DMTA, outs() << "\tInter-procedural LockAnalysis\n");
-    analyzeLockSpanCxtStmt();
+    analyzeLockSpanCxtStmt(icfg, cg);
 
     DOTIMESTAT(double lockEnd = PTAStat::getClk(true));
     DOTIMESTAT(lockTime += (lockEnd - lockStart) / TIMEINTERVAL);
@@ -66,25 +70,30 @@ void LockAnalysis::analyze()
 /*!
  * Collect lock/unlock sites
  */
-void LockAnalysis::collectLockUnlocksites()
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::collectLockUnlockSites(ICFGGraph icfg, CGGraph cg)
 {
     ThreadCallGraph* tcg=tct->getThreadCallGraph();
 
-    for (const auto& item : *PAG::getPAG()->getCallGraph())
+    using CGTraits = GenericGraphTraits<CGGraph>;
+    for (auto nodeIt = CGTraits::nodes_begin(cg),
+            nodeEnd = CGTraits::nodes_end(cg); nodeIt != nodeEnd; ++nodeIt)
     {
-        const FunObjVar* F = item.second->getFunction();
+        const FunObjVar* F = CGTraits::getRawNode(*nodeIt)->getFunction();
         for (auto it : *F)
         {
             const SVFBasicBlock* bb = it.second;
             for (const ICFGNode* icfgNode : bb->getICFGNodeList())
             {
+                if (!GenericGraphTraits<ICFGGraph>::containsNode(icfg, icfgNode))
+                    continue;
                 if (isa<CallICFGNode>(icfgNode) && tcg->getThreadAPI()->isTDRelease(cast<CallICFGNode>(icfgNode)))
                 {
-                    unlocksites.insert(icfgNode);
+                    unlockSites.insert(icfgNode);
                 }
                 if (isa<CallICFGNode>(icfgNode) && tcg->getThreadAPI()->isTDAcquire(cast<CallICFGNode>(icfgNode)))
                 {
-                    locksites.insert(icfgNode);
+                    lockSites.insert(icfgNode);
                 }
             }
         }
@@ -94,7 +103,8 @@ void LockAnalysis::collectLockUnlocksites()
 /*!
  * Collect candidate functions for context-sensitive lock analysis
  */
-void LockAnalysis::buildCandidateFuncSetforLock()
+template<class CGGraph>
+void LockAnalysis::buildCandidateFuncSetForLock(CGGraph cg)
 {
 
     ThreadCallGraph* tcg=tct->getThreadCallGraph();
@@ -102,7 +112,7 @@ void LockAnalysis::buildCandidateFuncSetforLock()
     TCT::PTACGNodeSet visited;
     FIFOWorkList<const CallGraphNode*> worklist;
 
-    for (InstSet::iterator it = locksites.begin(), eit = locksites.end(); it != eit; ++it)
+    for (InstSet::iterator it = lockSites.begin(), eit = lockSites.end(); it != eit; ++it)
     {
         const FunObjVar* fun=(*it)->getFun();
         CallGraphNode* cgnode = tcg->getCallGraphNode(fun);
@@ -112,7 +122,7 @@ void LockAnalysis::buildCandidateFuncSetforLock()
             visited.insert(cgnode);
         }
     }
-    for (InstSet::iterator it = unlocksites.begin(), eit = unlocksites.end(); it != eit; ++it)
+    for (InstSet::iterator it = unlockSites.begin(), eit = unlockSites.end(); it != eit; ++it)
     {
         const FunObjVar* fun = (*it)->getFun();
         CallGraphNode* cgnode = tcg->getCallGraphNode(fun);
@@ -125,10 +135,12 @@ void LockAnalysis::buildCandidateFuncSetforLock()
     while (!worklist.empty())
     {
         const CallGraphNode* node = worklist.pop();
-        lockcandidateFuncSet.insert(node->getFunction());
-        for (CallGraphNode::const_iterator nit = node->InEdgeBegin(), neit = node->InEdgeEnd(); nit != neit; nit++)
+        lockCandidateFuncSet.insert(node->getFunction());
+        std::vector<const CallGraphEdge*> inEdges;
+        GenericGraphTraits<CGGraph>::getInEdges(cg, node, inEdges);
+        for (const CallGraphEdge* edge : inEdges)
         {
-            const CallGraphNode* srcNode = (*nit)->getSrcNode();
+            const CallGraphNode* srcNode = edge->getSrcNode();
             if (visited.find(srcNode) == visited.end())
             {
                 visited.insert(srcNode);
@@ -142,11 +154,12 @@ void LockAnalysis::buildCandidateFuncSetforLock()
  * Analyze intraprocedural locks
  * A lock is intraprocedural if its lock span is within a procedural
  */
-void LockAnalysis::analyzeIntraProcedualLock()
+template<class ICFGGraph>
+void LockAnalysis::analyzeIntraProceduralLock(ICFGGraph icfg)
 {
 
     // Identify the protected Instructions.
-    for (InstSet::const_iterator it = locksites.begin(), ie = locksites.end(); it != ie; ++it)
+    for (InstSet::const_iterator it = lockSites.begin(), ie = lockSites.end(); it != ie; ++it)
     {
         const ICFGNode* lockSite = *it;
         assert(isCallSite(lockSite) && "Lock acquire instruction must be a CallSite");
@@ -156,8 +169,10 @@ void LockAnalysis::analyzeIntraProcedualLock()
         InstSet backwardInsts;
         InstSet unlockSet;
 
-        bool forward = intraForwardTraverse(lockSite,unlockSet,forwardInsts);
-        bool backward =	intraBackwardTraverse(unlockSet,backwardInsts);
+        bool forward = intraForwardTraverse(
+                           icfg, lockSite, unlockSet, forwardInsts);
+        bool backward = intraBackwardTraverse(
+                            icfg, unlockSet, backwardInsts);
 
         /// FIXME:Should we intersect forwardInsts and backwardInsts?
         if(forward && backward)
@@ -170,7 +185,10 @@ void LockAnalysis::analyzeIntraProcedualLock()
 /*!
  * Intra-procedural forward traversal
  */
-bool LockAnalysis::intraForwardTraverse(const ICFGNode* lockSite, InstSet& unlockSet, InstSet& forwardInsts)
+template<class ICFGGraph>
+bool LockAnalysis::intraForwardTraverse(
+    ICFGGraph icfg, const ICFGNode* lockSite, InstSet& unlockSet,
+    InstSet& forwardInsts)
 {
 
     const FunObjVar* svfFun = lockSite->getFun();
@@ -181,7 +199,10 @@ bool LockAnalysis::intraForwardTraverse(const ICFGNode* lockSite, InstSet& unloc
     {
         const ICFGNode *I = worklist.back();
         worklist.pop_back();
-        const ICFGNode* exitInst = svfFun->getExitBB()->back();
+        const ICFGNode* exitInst =
+            GenericGraphTraits<ICFGGraph>::getFunExit(icfg, svfFun);
+        if (exitInst == nullptr)
+            return false;
         if(exitInst == I)
             return false;
 
@@ -198,11 +219,13 @@ bool LockAnalysis::intraForwardTraverse(const ICFGNode* lockSite, InstSet& unloc
             continue;
         }
 
-        for(const ICFGEdge* outEdge : I->getOutEdges())
+        std::vector<const ICFGNode*> succ;
+        GenericGraphTraits<ICFGGraph>::getSuccNodes(icfg, I, succ);
+        for (const ICFGNode* dst : succ)
         {
-            if(outEdge->getDstNode()->getFun() == I->getFun())
+            if(dst->getFun() == I->getFun())
             {
-                worklist.push_back(outEdge->getDstNode());
+                worklist.push_back(dst);
             }
         }
     }
@@ -214,7 +237,9 @@ bool LockAnalysis::intraForwardTraverse(const ICFGNode* lockSite, InstSet& unloc
 /*!
  * Intra-procedural backward traversal
  */
-bool LockAnalysis::intraBackwardTraverse(const InstSet& unlockSet, InstSet& backwardInsts)
+template<class ICFGGraph>
+bool LockAnalysis::intraBackwardTraverse(
+    ICFGGraph icfg, const InstSet& unlockSet, InstSet& backwardInsts)
 {
 
     InstVec worklist;
@@ -244,11 +269,13 @@ bool LockAnalysis::intraBackwardTraverse(const InstSet& unlockSet, InstSet& back
                 continue;
             }
 
-            for(const ICFGEdge* inEdge : I->getInEdges())
+            std::vector<const ICFGNode*> pred;
+            GenericGraphTraits<ICFGGraph>::getPredNodes(icfg, I, pred);
+            for (const ICFGNode* src : pred)
             {
-                if(inEdge->getSrcNode()->getFun() == I->getFun())
+                if(src->getFun() == I->getFun())
                 {
-                    worklist.push_back(inEdge->getSrcNode());
+                    worklist.push_back(src);
                 }
             }
         }
@@ -258,10 +285,11 @@ bool LockAnalysis::intraBackwardTraverse(const InstSet& unlockSet, InstSet& back
 }
 
 
-void LockAnalysis::collectCxtLock()
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::collectCxtLock(ICFGGraph icfg, CGGraph cg)
 {
-    FunSet entryFuncSet = tct->getEntryProcs();
-    for (FunSet::const_iterator it = entryFuncSet.begin(), eit = entryFuncSet.end(); it != eit; ++it)
+    const TCT::FunSet& entryFuncSet = tct->getEntryProcs();
+    for (TCT::FunSet::const_iterator it = entryFuncSet.begin(), eit = entryFuncSet.end(); it != eit; ++it)
     {
         if (!isLockCandidateFun(*it))
             continue;
@@ -274,30 +302,33 @@ void LockAnalysis::collectCxtLock()
     {
         CxtLockProc clp = popFromCTPWorkList();
         CallGraphNode* cgNode = getTCG()->getCallGraphNode(clp.getProc());
-        // lzh TODO.
         if (!isLockCandidateFun(cgNode->getFunction()))
             continue;
 
-        for (CallGraphNode::const_iterator nit = cgNode->OutEdgeBegin(), neit = cgNode->OutEdgeEnd(); nit != neit; nit++)
+        std::vector<const CallGraphEdge*> outEdges;
+        GenericGraphTraits<CGGraph>::getOutEdges(cg, cgNode, outEdges);
+        for (const CallGraphEdge* cgEdge : outEdges)
         {
-            const CallGraphEdge* cgEdge = (*nit);
-
-            for (CallGraphEdge::CallInstSet::const_iterator cit = cgEdge->directCallsBegin(), ecit = cgEdge->directCallsEnd();
-                    cit != ecit; ++cit)
+            std::vector<const CallICFGNode*> directCalls;
+            GenericGraphTraits<CGGraph>::getDirectCalls(
+                cg, cgEdge, directCalls);
+            for (const CallICFGNode* callSite : directCalls)
             {
                 DBOUT(DMTA,
-                      outs() << "\nCollecting CxtLocks: handling direct call:" << **cit << "\t" << cgEdge->getSrcNode()->getFunction()->getName()
+                      outs() << "\nCollecting CxtLocks: handling direct call:" << *callSite << "\t" << cgEdge->getSrcNode()->getFunction()->getName()
                       << "-->" << cgEdge->getDstNode()->getFunction()->getName() << "\n");
-                handleCallRelation(clp, cgEdge, *cit);
+                handleCallRelation(icfg, cg, clp, cgEdge, callSite);
             }
-            for (CallGraphEdge::CallInstSet::const_iterator ind = cgEdge->indirectCallsBegin(), eind = cgEdge->indirectCallsEnd();
-                    ind != eind; ++ind)
+            std::vector<const CallICFGNode*> indirectCalls;
+            GenericGraphTraits<CGGraph>::getIndirectCalls(
+                cg, cgEdge, indirectCalls);
+            for (const CallICFGNode* callSite : indirectCalls)
             {
                 DBOUT(DMTA,
-                      outs() << "\nCollecting CxtLocks: handling indirect call:" << **ind << "\t"
+                      outs() << "\nCollecting CxtLocks: handling indirect call:" << *callSite << "\t"
                       << cgEdge->getSrcNode()->getFunction()->getName() << "-->" << cgEdge->getDstNode()->getFunction()->getName()
                       << "\n");
-                handleCallRelation(clp, cgEdge, *ind);
+                handleCallRelation(icfg, cg, clp, cgEdge, callSite);
             }
         }
     }
@@ -307,11 +338,14 @@ void LockAnalysis::collectCxtLock()
 /*!
  * Handling call relations when collecting context-sensitive locks
  */
-void LockAnalysis::handleCallRelation(CxtLockProc& clp, const CallGraphEdge* cgEdge, const CallICFGNode* cs)
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::handleCallRelation(ICFGGraph icfg, CGGraph cg, CxtLockProc& clp, const CallGraphEdge* cgEdge, const CallICFGNode* cs)
 {
 
     CallStrCxt cxt(clp.getContext());
     const ICFGNode* curNode = cs;
+    if (!GenericGraphTraits<ICFGGraph>::containsNode(icfg, curNode))
+        return;
     if (isTDAcquire(curNode))
     {
         addCxtLock(cxt,curNode);
@@ -329,16 +363,26 @@ void LockAnalysis::handleCallRelation(CxtLockProc& clp, const CallGraphEdge* cgE
 
 }
 
-void LockAnalysis::analyzeLockSpanCxtStmt()
+bool LockAnalysis::isAliasedLocks(const ICFGNode* i1, const ICFGNode* i2)
+{
+    // Lock matching is conservative: may-alias lock objects are treated as the
+    // same lock, consistent with the existing MTA lock semantics.
+    return tct->getPTA()->alias(getLockVal(i1)->getId(), getLockVal(i2)->getId());
+}
+
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::analyzeLockSpanCxtStmt(ICFGGraph icfg, CGGraph cg)
 {
 
-    FunSet entryFuncSet = tct->getEntryProcs();
-    for (FunSet::const_iterator it = entryFuncSet.begin(), eit = entryFuncSet.end(); it != eit; ++it)
+    const TCT::FunSet& entryFuncSet = tct->getEntryProcs();
+    for (TCT::FunSet::const_iterator it = entryFuncSet.begin(), eit = entryFuncSet.end(); it != eit; ++it)
     {
         if (!isLockCandidateFun(*it))
             continue;
         CallStrCxt cxt;
-        const ICFGNode* frontInst = (*it)->getEntryBlock()->front();
+        const ICFGNode* frontInst = GenericGraphTraits<ICFGGraph>::getFunEntry(icfg, *it);
+        if (!GenericGraphTraits<ICFGGraph>::containsNode(icfg, frontInst))
+            continue;
         CxtStmt cxtstmt(cxt, frontInst);
         pushToCTSWorkList(cxtstmt);
     }
@@ -349,8 +393,11 @@ void LockAnalysis::analyzeLockSpanCxtStmt()
 
         touchCxtStmt(cts);
         const ICFGNode* curInst = cts.getStmt();
-        instToCxtStmtSet[curInst].insert(cts);
-
+        if (!GenericGraphTraits<ICFGGraph>::containsNode(icfg, curInst))
+            continue;
+        const bool firstContextVisit = instToCxtStmtSet[curInst].insert(cts).second;
+        if (firstContextVisit && isCallSite(curInst))
+            indexCallsiteContext(curInst, cts.getContext());
         DBOUT(DMTA, outs() << "\nVisit cxtStmt: ");
         DBOUT(DMTA, cts.dump());
 
@@ -359,30 +406,36 @@ void LockAnalysis::analyzeLockSpanCxtStmt()
 
         if (isTDFork(curInst))
         {
-            handleFork(cts);
+            handleFork(icfg, cg, cts);
         }
         else if (isTDAcquire(curInst))
         {
-            assert(hasCxtLock(cts) && "context-sensitive lock not found!!");
-            if(addCxtStmtToSpan(cts,cts))
-                handleIntra(cts);
+            // Context truncation can merge a path into a lock context that the
+            // call-graph pre-collection did not enumerate. The propagation is
+            // authoritative: register that reachable lock before constructing
+            // its span. Release builds already constructed the same span; this
+            // keeps the canonical lock registry consistent as well.
+            if (!hasCxtLock(cts))
+                addCxtLock(cts.getContext(), curInst);
+            if (addCxtStmtToSpan(cts, cts))
+                handleIntra(icfg, cg, cts);
         }
         else if (isTDRelease(curInst))
         {
             if(removeCxtStmtToSpan(cts,cts))
-                handleIntra(cts);
+                handleIntra(icfg, cg, cts);
         }
         else if (isCallSite(curInst) && !isExtCall(curInst))
         {
-            handleCall(cts);
+            handleCall(icfg, cg, cts);
         }
         else if (SVFUtil::dyn_cast<FunExitICFGNode>(curInst))
         {
-            handleRet(cts);
+            handleRet(icfg, cg, cts);
         }
         else
         {
-            handleIntra(cts);
+            handleIntra(icfg, cg, cts);
         }
 
     }
@@ -395,7 +448,7 @@ void LockAnalysis::analyzeLockSpanCxtStmt()
  */
 void LockAnalysis::printLocks(const CxtStmt& cts)
 {
-    const CxtLockSet & lockset = getCxtLockfromCxtStmt(cts);
+    const CxtLockSet & lockset = getCxtLockFromCxtStmt(cts);
     outs() << "\nlock sets size = " << lockset.size() << "\n";
     for (CxtLockSet::const_iterator it = lockset.begin(), eit = lockset.end(); it != eit; ++it)
     {
@@ -406,134 +459,157 @@ void LockAnalysis::printLocks(const CxtStmt& cts)
 
 
 /// Handle fork
-void LockAnalysis::handleFork(const CxtStmt& cts)
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::handleFork(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts)
 {
     const CallStrCxt& curCxt = cts.getContext();
     const CallICFGNode* call = SVFUtil::dyn_cast<CallICFGNode>(cts.getStmt());
-    if(getTCG()->hasThreadForkEdge(call))
+    const CallGraphNode* callerNode = getTCG()->getCallGraphNode(call->getFun());
+    std::vector<const CallGraphEdge*> outEdges;
+    GenericGraphTraits<CGGraph>::getOutEdges(cg, callerNode, outEdges);
+    for (const CallGraphEdge* edge : outEdges)
     {
-        for (ThreadCallGraph::ForkEdgeSet::const_iterator cgIt = getTCG()->getForkEdgeBegin(call),
-                ecgIt = getTCG()->getForkEdgeEnd(call); cgIt != ecgIt; ++cgIt)
-        {
-            const FunObjVar* svfcallee = (*cgIt)->getDstNode()->getFunction();
-            CallStrCxt newCxt = curCxt;
-            pushCxt(newCxt,call,svfcallee);
-            const ICFGNode* svfInst = svfcallee->getEntryBlock()->front();
-            CxtStmt newCts(newCxt, svfInst);
-            markCxtStmtFlag(newCts, cts);
-        }
+        if (!SVFUtil::isa<ThreadForkEdge>(edge) ||
+                !GenericGraphTraits<CGGraph>::containsCallSite(cg, edge, call))
+            continue;
+        const FunObjVar* svfcallee = edge->getDstNode()->getFunction();
+        CallStrCxt newCxt = curCxt;
+        pushCxt(newCxt, call, svfcallee);
+        const ICFGNode* svfInst =
+            GenericGraphTraits<ICFGGraph>::getFunEntry(icfg, svfcallee);
+        if (svfInst == nullptr)
+            continue;
+        CxtStmt newCts(newCxt, svfInst);
+        markCxtStmtFlag(newCts, cts);
     }
-    handleIntra(cts);
+    handleIntra(icfg, cg, cts);
 }
 
 /// Handle call
-void LockAnalysis::handleCall(const CxtStmt& cts)
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::handleCall(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts)
 {
 
     const CallStrCxt& curCxt = cts.getContext();
     const CallICFGNode* call = SVFUtil::dyn_cast<CallICFGNode>(cts.getStmt());
-    if (getTCG()->hasCallGraphEdge(call))
+    const CallGraphNode* callerNode = getTCG()->getCallGraphNode(call->getFun());
+    std::vector<const CallGraphEdge*> outEdges;
+    GenericGraphTraits<CGGraph>::getOutEdges(cg, callerNode, outEdges);
+    for (const CallGraphEdge* edge : outEdges)
     {
-        for (CallGraph::CallGraphEdgeSet::const_iterator cgIt = getTCG()->getCallEdgeBegin(call), ecgIt = getTCG()->getCallEdgeEnd(call);
-                cgIt != ecgIt; ++cgIt)
+        if (edge->getEdgeKind() != CallGraphEdge::CallRetEdge ||
+                !GenericGraphTraits<CGGraph>::containsCallSite(cg, edge, call))
+            continue;
+        const FunObjVar* svfcallee = edge->getDstNode()->getFunction();
+        if (SVFUtil::isExtCall(svfcallee))
+            continue;
+        CallStrCxt newCxt = curCxt;
+        pushCxt(newCxt, call, svfcallee);
+        const ICFGNode* svfInst =
+            GenericGraphTraits<ICFGGraph>::getFunEntry(icfg, svfcallee);
+        if (svfInst == nullptr)
+            continue;
+        CxtStmt newCts(newCxt, svfInst);
+        markCxtStmtFlag(newCts, cts);
+
+        // Return-flow rendezvous (see MHP::handleCall): forward an already
+        // computed callee-exit lockset to this callsite's return site.
+        if (svfcallee->hasBasicBlock())
         {
-            const FunObjVar* svfcallee = (*cgIt)->getDstNode()->getFunction();
-            if (SVFUtil::isExtCall(svfcallee))
+            const ICFGNode* exitInst =
+                GenericGraphTraits<ICFGGraph>::getFunExit(icfg, svfcallee);
+            if (exitInst == nullptr)
                 continue;
-            CallStrCxt newCxt = curCxt;
-            pushCxt(newCxt, call, svfcallee);
-            const ICFGNode* svfInst = svfcallee->getEntryBlock()->front();
-            CxtStmt newCts(newCxt, svfInst);
-            markCxtStmtFlag(newCts, cts);
+            CxtStmt exitCts(newCxt, exitInst);
+            if (hasCxtLockFromCxtStmt(exitCts))
+            {
+                const ICFGNode* retNode = call->getRetICFGNode();
+                if (GenericGraphTraits<ICFGGraph>::containsNode(icfg, retNode))
+                {
+                    CxtStmt retCts(curCxt, retNode);
+                    markCxtStmtFlag(retCts, exitCts);
+                }
+            }
+        }
+    }
+}
+
+void LockAnalysis::handleReturnAtCallsite(
+    const CxtStmt& exitCxtStmt, const FunObjVar* callee,
+    const ICFGNode* callsite, const std::vector<const ICFGNode*>& successors)
+{
+    CallStrCxt callerCxt = exitCxtStmt.getContext();
+    const CallICFGNode* call = SVFUtil::cast<CallICFGNode>(callsite);
+    if (!matchCxt(callerCxt, call, callee))
+        return;
+
+    for (const ICFGNode* successor : successors)
+    {
+        if (successor->getFun() != callsite->getFun())
+            continue;
+
+        const CallStrCxtSet* matchingContexts =
+            getCallsiteContextsWithSuffix(callsite, callerCxt);
+        if (matchingContexts == nullptr)
+            continue;
+
+        for (const CallStrCxt& callsiteCxt : *matchingContexts)
+        {
+            CxtStmt returnCxtStmt(callsiteCxt, successor);
+            markCxtStmtFlag(returnCxtStmt, exitCxtStmt);
         }
     }
 }
 
 /// Handle return
-void LockAnalysis::handleRet(const CxtStmt& cts)
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::handleRet(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts)
 {
 
     const ICFGNode* curInst = cts.getStmt();
-    const CallStrCxt& curCxt = cts.getContext();
     const FunObjVar* svffun = curInst->getFun();
     CallGraphNode* curFunNode = getTCG()->getCallGraphNode(svffun);
 
-    for (CallGraphNode::const_iterator it = curFunNode->getInEdges().begin(), eit = curFunNode->getInEdges().end(); it != eit; ++it)
+    std::vector<const ICFGNode*> succ;
+    GenericGraphTraits<ICFGGraph>::getSuccNodes(icfg, curInst, succ);
+
+    std::vector<const CallGraphEdge*> inEdges;
+    GenericGraphTraits<CGGraph>::getInEdges(cg, curFunNode, inEdges);
+    for (const CallGraphEdge* edgeConst : inEdges)
     {
-        CallGraphEdge* edge = *it;
-        if (SVFUtil::isa<ThreadForkEdge, ThreadJoinEdge>(edge))
+        if (SVFUtil::isa<ThreadForkEdge, ThreadJoinEdge>(edgeConst))
             continue;
-        for (CallGraphEdge::CallInstSet::const_iterator cit = (edge)->directCallsBegin(), ecit = (edge)->directCallsEnd(); cit != ecit;
-                ++cit)
-        {
-            CallStrCxt newCxt = curCxt;
-            const ICFGNode* inst = *cit;
-            if (matchCxt(newCxt, SVFUtil::cast<CallICFGNode>(inst), curFunNode->getFunction()))
-            {
-                for(const ICFGEdge* outEdge : curInst->getOutEdges())
-                {
-                    if(outEdge->getDstNode()->getFun() == inst->getFun())
-                    {
-                        // Iterate over callSite's call string context and use as the successor's context
-                        if (!hasCxtStmtFromInst(*cit))
-                            continue;
-                        for (const CxtStmt& cxtStmt: getCxtStmtsFromInst(*cit))
-                        {
-                            CallStrCxt callSiteCxt = cxtStmt.getContext();
-                            // If new context is a suffix of the call site context
-                            if (isContextSuffix(newCxt, callSiteCxt))
-                            {
-                                CxtStmt newCts(callSiteCxt, outEdge->getDstNode());
-                                markCxtStmtFlag(newCts, cts);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (CallGraphEdge::CallInstSet::const_iterator cit = (edge)->indirectCallsBegin(), ecit = (edge)->indirectCallsEnd();
-                cit != ecit; ++cit)
-        {
-            CallStrCxt newCxt = curCxt;
-            const ICFGNode* inst = *cit;
-            if (matchCxt(newCxt, SVFUtil::cast<CallICFGNode>(inst), curFunNode->getFunction()))
-            {
-                for(const ICFGEdge* outEdge : curInst->getOutEdges())
-                {
-                    if(outEdge->getDstNode()->getFun() == inst->getFun())
-                    {
-                        // Iterate over callSite's call string context and use as the successor's context
-                        if (!hasCxtStmtFromInst(*cit))
-                            continue;
-                        for (const CxtStmt& cxtStmt: getCxtStmtsFromInst(*cit))
-                        {
-                            CallStrCxt callSiteCxt = cxtStmt.getContext();
-                            // If new context is a suffix of the call site context
-                            if (isContextSuffix(newCxt, callSiteCxt))
-                            {
-                                CxtStmt newCts(callSiteCxt, outEdge->getDstNode());
-                                markCxtStmtFlag(newCts, cts);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        std::vector<const CallICFGNode*> directCalls;
+        GenericGraphTraits<CGGraph>::getDirectCalls(
+            cg, edgeConst, directCalls);
+        for (const CallICFGNode* callSite : directCalls)
+            handleReturnAtCallsite(
+                cts, curFunNode->getFunction(), callSite, succ);
+
+        std::vector<const CallICFGNode*> indirectCalls;
+        GenericGraphTraits<CGGraph>::getIndirectCalls(
+            cg, edgeConst, indirectCalls);
+        for (const CallICFGNode* callSite : indirectCalls)
+            handleReturnAtCallsite(
+                cts, curFunNode->getFunction(), callSite, succ);
     }
 }
 
 /// Handle intra
-void LockAnalysis::handleIntra(const CxtStmt& cts)
+template<class ICFGGraph, class CGGraph>
+void LockAnalysis::handleIntra(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts)
 {
 
     const ICFGNode* curInst = cts.getStmt();
     const CallStrCxt& curCxt = cts.getContext();
 
-    for(const ICFGEdge* outEdge : curInst->getOutEdges())
+    std::vector<const ICFGNode*> succ;
+    GenericGraphTraits<ICFGGraph>::getSuccNodes(icfg, curInst, succ);
+    for (const ICFGNode* dst : succ)
     {
-        if(outEdge->getDstNode()->getFun() == curInst->getFun())
+        if(dst->getFun() == curInst->getFun())
         {
-            CxtStmt newCts(curCxt, outEdge->getDstNode());
+            CxtStmt newCts(curCxt, dst);
             markCxtStmtFlag(newCts, cts);
         }
     }
@@ -618,10 +694,10 @@ bool LockAnalysis::isProtectedByCommonCILock(const ICFGNode *i1, const ICFGNode 
  */
 bool LockAnalysis::isProtectedByCommonCxtLock(const CxtStmt& cxtStmt1, const CxtStmt& cxtStmt2)
 {
-    if(!hasCxtLockfromCxtStmt(cxtStmt1) || !hasCxtLockfromCxtStmt(cxtStmt2))
-        return true;
-    const CxtLockSet& lockset1 = getCxtLockfromCxtStmt(cxtStmt1);
-    const CxtLockSet& lockset2 = getCxtLockfromCxtStmt(cxtStmt2);
+    if(!hasCxtLockFromCxtStmt(cxtStmt1) || !hasCxtLockFromCxtStmt(cxtStmt2))
+        return false;
+    const CxtLockSet& lockset1 = getCxtLockFromCxtStmt(cxtStmt1);
+    const CxtLockSet& lockset2 = getCxtLockFromCxtStmt(cxtStmt2);
     return alias(lockset1,lockset2);
 }
 
@@ -640,7 +716,18 @@ bool LockAnalysis::isProtectedByCommonCxtLock(const ICFGNode *i1, const ICFGNode
         for (CxtStmtSet::const_iterator cts2 = ctsset2.begin(), ects2 = ctsset2.end(); cts2 != ects2; cts2++)
         {
             const CxtStmt& cxtStmt2 = *cts2;
-            if(cxtStmt1==cxtStmt2) continue;
+            if(cxtStmt1==cxtStmt2)
+            {
+                // i1==i2 under the same context: a self-race between two dynamic
+                // instances of one statement (e.g. a thread forked in a loop).
+                // This is the ONLY pair the loop produces for such a query, so
+                // skipping it would fall through to the vacuous "protected" return
+                // below and drop a real race. The two instances are mutually
+                // excluded only if this context actually holds a (non-empty) lock.
+                if(!hasCxtLockFromCxtStmt(cxtStmt1) || getCxtLockFromCxtStmt(cxtStmt1).empty())
+                    return false;
+                continue;
+            }
             if(isProtectedByCommonCxtLock(cxtStmt1,cxtStmt2)==false)
                 return false;
         }
@@ -693,10 +780,10 @@ bool LockAnalysis::isInSameCISpan(const ICFGNode *i1, const ICFGNode *i2) const
  */
 bool LockAnalysis::isInSameCSSpan(const CxtStmt& cxtStmt1, const CxtStmt& cxtStmt2) const
 {
-    if(!hasCxtLockfromCxtStmt(cxtStmt1) || !hasCxtLockfromCxtStmt(cxtStmt2))
-        return true;
-    const CxtLockSet& lockset1 = getCxtLockfromCxtStmt(cxtStmt1);
-    const CxtLockSet& lockset2 = getCxtLockfromCxtStmt(cxtStmt2);
+    if(!hasCxtLockFromCxtStmt(cxtStmt1) || !hasCxtLockFromCxtStmt(cxtStmt2))
+        return false;
+    const CxtLockSet& lockset1 = getCxtLockFromCxtStmt(cxtStmt1);
+    const CxtLockSet& lockset2 = getCxtLockFromCxtStmt(cxtStmt2);
     return intersects(lockset1,lockset2);
 }
 /*!
@@ -722,3 +809,8 @@ bool LockAnalysis::isInSameCSSpan(const ICFGNode *I1, const ICFGNode *I2) const
     }
     return true;
 }
+
+// The two graphs the lock analysis runs on; the algorithm above is written once
+// and instantiated for both (all internal templates instantiate transitively).
+template void LockAnalysis::analyze<ICFG*, CallGraph*>(ICFG*, CallGraph*);
+template void LockAnalysis::analyze<const SlicedICFGView*, const SlicedThreadCallGraphView*>(const SlicedICFGView*, const SlicedThreadCallGraphView*);

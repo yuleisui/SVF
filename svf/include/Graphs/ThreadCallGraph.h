@@ -142,7 +142,18 @@ class ThreadCallGraph: public CallGraph
 {
 
 public:
-    typedef Set<const CallICFGNode*> InstSet;
+    /// Order fork/join callsites by ICFG node id, never by pointer value:
+    /// thread ids are assigned in discovery order over these sets (TCT), and
+    /// the MHP/lock fixed points seed from them, so their iteration order must
+    /// be identical across runs (a pointer-hashed set varies with ASLR).
+    struct CallSiteIdCmp
+    {
+        bool operator()(const CallICFGNode* lhs, const CallICFGNode* rhs) const
+        {
+            return lhs->getId() < rhs->getId();
+        }
+    };
+    typedef OrderedSet<const CallICFGNode*, CallSiteIdCmp> InstSet;
     typedef InstSet CallSiteSet;
     typedef Set<CallSiteSet*> CtxSet;
     typedef ThreadForkEdge::ForkEdgeSet ForkEdgeSet;
@@ -158,9 +169,7 @@ public:
     ThreadCallGraph(ThreadCallGraph& cg) = delete;
 
     /// Destructor
-    virtual ~ThreadCallGraph()
-    {
-    }
+    virtual ~ThreadCallGraph();
 
     /// ClassOf
     //@{
@@ -392,6 +401,43 @@ private:
     CallInstToForkEdgesMap callinstToThreadForkEdgesMap; ///< Map a call instruction to its corresponding fork edges
     CallInstToJoinEdgesMap callinstToThreadJoinEdgesMap; ///< Map a call instruction to its corresponding join edges
     CallInstToParForEdgesMap callinstToHareParForEdgesMap; ///< Map a call instruction to its corresponding hare_parallel_for edges
+};
+
+} // End namespace SVF
+
+namespace SVF
+{
+
+/// Thread-specific relations are indexed by callsite rather than represented
+/// uniformly in CallGraph node adjacency. In particular, ThreadJoinEdge is not
+/// added to adjacency because it would introduce artificial SCC cycles.
+template<>
+struct GenericGraphTraits<SVF::ThreadCallGraph*>
+    : public GenericGraphTraits<SVF::CallGraph*>
+{
+    static void getForkEdges(const SVF::ThreadCallGraph* graph,
+                             const SVF::CallICFGNode* callSite,
+                             std::vector<const SVF::CallGraphEdge*>& out)
+    {
+        out.clear();
+        if (!graph->hasThreadForkEdge(callSite))
+            return;
+        for (auto it = graph->getForkEdgeBegin(callSite),
+                end = graph->getForkEdgeEnd(callSite); it != end; ++it)
+            out.push_back(*it);
+    }
+
+    static void getJoinEdges(const SVF::ThreadCallGraph* graph,
+                             const SVF::CallICFGNode* callSite,
+                             std::vector<const SVF::CallGraphEdge*>& out)
+    {
+        out.clear();
+        if (!graph->hasThreadJoinEdge(callSite))
+            return;
+        for (auto it = graph->getJoinEdgeBegin(callSite),
+                end = graph->getJoinEdgeEnd(callSite); it != end; ++it)
+            out.push_back(*it);
+    }
 };
 
 } // End namespace SVF

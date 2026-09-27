@@ -35,8 +35,14 @@
  */
 #include "MTA/TCT.h"
 
+#include <memory>
+#include <vector>
+
 namespace SVF
 {
+
+// Forward declaration for the sliced-graph handle analyze() can run on.
+class SlicedSVFIRView;
 
 /*!
  * Lock analysis
@@ -68,6 +74,9 @@ public:
     typedef Set<CxtStmt> LockSpan;
     typedef Set<CxtStmt> CxtStmtSet;
     typedef Set<CxtLock> CxtLockSet;
+    typedef Set<CallStrCxt> CallStrCxtSet;
+    typedef Map<CallStrCxt, CallStrCxtSet> ContextSuffixToContexts;
+    typedef Map<const ICFGNode*, ContextSuffixToContexts> InstToContextSuffixMap;
 
     typedef Map<CxtLock, LockSpan> CxtLockToSpan;
     typedef Map<CxtLock, NodeBS> CxtLockToLockSet;
@@ -81,27 +90,36 @@ public:
     {
     }
 
+    ~LockAnalysis() = default;
+
     /// context-sensitive forward traversal from each lock site. Generate following results
     /// (1) context-sensitive lock site,
     /// (2) maps a context-sensitive lock site to its corresponding lock span.
-    void analyze();
-    void analyzeIntraProcedualLock();
-    bool intraForwardTraverse(const ICFGNode* lock, InstSet& unlockset, InstSet& forwardInsts);
-    bool intraBackwardTraverse(const InstSet& unlockset, InstSet& backwardInsts);
+    /// The same implementation runs over full and sliced ICFG/CallGraph traits.
+    template<class ICFGGraph, class CGGraph> void analyze(ICFGGraph icfg, CGGraph cg);
+    template<class ICFGGraph>
+    void analyzeIntraProceduralLock(ICFGGraph icfg);
+    template<class ICFGGraph>
+    bool intraForwardTraverse(ICFGGraph icfg, const ICFGNode* lock,
+                              InstSet& unlockSet, InstSet& forwardInsts);
+    template<class ICFGGraph>
+    bool intraBackwardTraverse(ICFGGraph icfg, const InstSet& unlockSet,
+                               InstSet& backwardInsts);
 
-    void collectCxtLock();
-    void analyzeLockSpanCxtStmt();
+    template<class ICFGGraph, class CGGraph> void collectCxtLock(ICFGGraph icfg, CGGraph cg);
+    template<class ICFGGraph, class CGGraph> void analyzeLockSpanCxtStmt(ICFGGraph icfg, CGGraph cg);
 
-    void collectLockUnlocksites();
-    void buildCandidateFuncSetforLock();
+    template<class ICFGGraph, class CGGraph> void collectLockUnlockSites(ICFGGraph icfg, CGGraph cg);
+    template<class CGGraph>
+    void buildCandidateFuncSetForLock(CGGraph cg);
 
     /// Intraprocedural locks
     //@{
     /// Return true if the lock is an intra-procedural lock
     inline bool isIntraLock(const ICFGNode* lock) const
     {
-        assert(locksites.find(lock)!=locksites.end() && "not a lock site?");
-        return ciLocktoSpan.find(lock)!=ciLocktoSpan.end();
+        assert(lockSites.find(lock)!=lockSites.end() && "not a lock site?");
+        return ciLockToSpan.find(lock)!=ciLockToSpan.end();
     }
 
     /// Add intra-procedural lock
@@ -110,7 +128,7 @@ public:
         for(InstSet::const_iterator it = stmts.begin(), eit = stmts.end(); it!=eit; ++it)
         {
             instCILocksMap[*it].insert(lockSite);
-            ciLocktoSpan[lockSite].insert(*it);
+            ciLockToSpan[lockSite].insert(*it);
         }
     }
 
@@ -119,7 +137,7 @@ public:
     {
         for(InstSet::const_iterator it = stmts.begin(), eit = stmts.end(); it!=eit; ++it)
         {
-            instTocondCILocksMap[*it].insert(lockSite);
+            instToCondCILocksMap[*it].insert(lockSite);
         }
     }
 
@@ -132,13 +150,31 @@ public:
     /// Return true if a statement is inside a partial lock/unlock pair (conditional lock with unconditional unlock)
     inline bool isInsideCondIntraLock(const ICFGNode* stmt) const
     {
-        return instTocondCILocksMap.find(stmt)!=instTocondCILocksMap.end();
+        return instToCondCILocksMap.find(stmt)!=instToCondCILocksMap.end();
+    }
+
+    /// Whether a statement has an (unconditional) intra-procedural lock set, i.e.
+    /// getIntraLockSet is valid for it. A statement can be locked (isInsideIntraLock)
+    /// via a *conditional* intra lock or a *context* lock without being here.
+    inline bool hasIntraLockSet(const ICFGNode* stmt) const
+    {
+        return instCILocksMap.find(stmt)!=instCILocksMap.end();
     }
 
     inline const InstSet& getIntraLockSet(const ICFGNode* stmt) const
     {
         InstToInstSetMap::const_iterator it = instCILocksMap.find(stmt);
         assert(it!=instCILocksMap.end() && "intralock not found!");
+        return it->second;
+    }
+
+    /// Return the conditional intra-procedural locks whose may-spans contain
+    /// stmt. Slicing needs these witnesses even though a conditional lock is
+    /// not strong enough to prove mutual exclusion at the client query.
+    inline const InstSet& getCondIntraLockSet(const ICFGNode* stmt) const
+    {
+        InstToInstSetMap::const_iterator it = instToCondCILocksMap.find(stmt);
+        assert(it!=instToCondCILocksMap.end() && "conditional intralock not found!");
         return it->second;
     }
     //@}
@@ -149,14 +185,14 @@ public:
     inline void addCxtLock(const CallStrCxt& cxt,const ICFGNode* inst)
     {
         CxtLock cxtlock(cxt,inst);
-        cxtLockset.insert(cxtlock);
+        cxtLockSet.insert(cxtlock);
         DBOUT(DMTA, SVFUtil::outs() << "LockAnalysis Process new lock "; cxtlock.dump());
     }
 
     /// Get context-sensitive lock
     inline bool hasCxtLock(const CxtLock& cxtLock) const
     {
-        return cxtLockset.find(cxtLock)!=cxtLockset.end();
+        return cxtLockSet.find(cxtLock)!=cxtLockSet.end();
     }
 
     /// Return true if the intersection of two locksets is not empty
@@ -192,7 +228,7 @@ public:
     /// Return true if it is a candidate function
     inline bool isLockCandidateFun(const FunObjVar* fun) const
     {
-        return lockcandidateFuncSet.find(fun)!=lockcandidateFuncSet.end();
+        return lockCandidateFuncSet.find(fun)!=lockCandidateFuncSet.end();
     }
 
     /// Context-sensitive statement and lock spans
@@ -209,18 +245,39 @@ public:
         assert(it != instToCxtStmtSet.end());
         return it->second;
     }
-    inline bool hasCxtLockfromCxtStmt(const CxtStmt& cts) const
+    /// Index a callsite context by each of its suffixes (including itself and
+    /// the empty suffix). handleRet can then retrieve exactly the contexts
+    /// accepted by TCT::isContextSuffix without scanning every callsite state.
+    inline void indexCallsiteContext(const ICFGNode* inst, const CallStrCxt& cxt)
+    {
+        ContextSuffixToContexts& suffixIndex = callsiteContextSuffixIndex[inst];
+        for (size_t begin = 0; begin <= cxt.size(); ++begin)
+        {
+            CallStrCxt suffix(cxt.begin() + begin, cxt.end());
+            suffixIndex[suffix].insert(cxt);
+        }
+    }
+    inline const CallStrCxtSet* getCallsiteContextsWithSuffix(
+        const ICFGNode* inst, const CallStrCxt& suffix) const
+    {
+        InstToContextSuffixMap::const_iterator instIt = callsiteContextSuffixIndex.find(inst);
+        if (instIt == callsiteContextSuffixIndex.end())
+            return nullptr;
+        ContextSuffixToContexts::const_iterator suffixIt = instIt->second.find(suffix);
+        return suffixIt == instIt->second.end() ? nullptr : &suffixIt->second;
+    }
+    inline bool hasCxtLockFromCxtStmt(const CxtStmt& cts) const
     {
         CxtStmtToCxtLockSet::const_iterator it = cxtStmtToCxtLockSet.find(cts);
         return (it != cxtStmtToCxtLockSet.end());
     }
-    inline const CxtLockSet& getCxtLockfromCxtStmt(const CxtStmt& cts) const
+    inline const CxtLockSet& getCxtLockFromCxtStmt(const CxtStmt& cts) const
     {
         CxtStmtToCxtLockSet::const_iterator it = cxtStmtToCxtLockSet.find(cts);
         assert(it != cxtStmtToCxtLockSet.end());
         return it->second;
     }
-    inline CxtLockSet& getCxtLockfromCxtStmt(const CxtStmt& cts)
+    inline CxtLockSet& getCxtLockFromCxtStmt(const CxtStmt& cts)
     {
         CxtStmtToCxtLockSet::iterator it = cxtStmtToCxtLockSet.find(cts);
         assert(it != cxtStmtToCxtLockSet.end());
@@ -229,7 +286,7 @@ public:
     /// Add context-sensitive statement
     inline bool addCxtStmtToSpan(const CxtStmt& cts, const CxtLock& cl)
     {
-        cxtLocktoSpan[cl].insert(cts);
+        cxtLockToSpan[cl].insert(cts);
         return cxtStmtToCxtLockSet[cts].insert(cl).second;
     }
     /// Add context-sensitive statement
@@ -239,32 +296,26 @@ public:
         if(find)
         {
             cxtStmtToCxtLockSet[cts].erase(cl);
-            cxtLocktoSpan[cl].erase(cts);
+            cxtLockToSpan[cl].erase(cts);
         }
         return find;
     }
 
-    CxtStmtToCxtLockSet getCSTCLS()
-    {
-        return cxtStmtToCxtLockSet;
-    }
     /// Touch this context statement
     inline void touchCxtStmt(CxtStmt& cts)
     {
         cxtStmtToCxtLockSet[cts];
     }
-    inline bool hasSpanfromCxtLock(const CxtLock& cl)
+    inline bool hasSpanFromCxtLock(const CxtLock& cl)
     {
-        return cxtLocktoSpan.find(cl) != cxtLocktoSpan.end();
+        return cxtLockToSpan.find(cl) != cxtLockToSpan.end();
     }
-    inline LockSpan& getSpanfromCxtLock(const CxtLock& cl)
+    inline LockSpan& getSpanFromCxtLock(const CxtLock& cl)
     {
-        assert(cxtLocktoSpan.find(cl) != cxtLocktoSpan.end());
-        return cxtLocktoSpan[cl];
+        assert(cxtLockToSpan.find(cl) != cxtLockToSpan.end());
+        return cxtLockToSpan[cl];
     }
     //@}
-
-
 
     /// Check if one instruction's context stmt is in a lock span
     inline bool hasOneCxtInLockSpan(const ICFGNode *I, LockSpan lspan) const
@@ -297,7 +348,6 @@ public:
         return true;
     }
 
-
     /// Check if two Instructions are protected by common locks
     /// echo inst may have multiple cxt stmt
     /// we check whether every cxt stmt of instructions is protected by a common lock.
@@ -313,7 +363,7 @@ public:
 
     inline u32_t getNumOfCxtLocks()
     {
-        return cxtLockset.size();
+        return cxtLockSet.size();
     }
     /// Print locks and spans
     void printLocks(const CxtStmt& cts);
@@ -323,40 +373,41 @@ public:
     {
         return tct;
     }
-private:
+protected:
     /// Handle fork
-    void handleFork(const CxtStmt& cts);
+    template<class ICFGGraph, class CGGraph> void handleFork(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts);
 
     /// Handle call
-    void handleCall(const CxtStmt& cts);
+    template<class ICFGGraph, class CGGraph> void handleCall(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts);
 
     /// Handle return
-    void handleRet(const CxtStmt& cts);
+    template<class ICFGGraph, class CGGraph> void handleRet(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts);
+
+    /// Propagate a callee-exit lock state to one matching callsite context.
+    void handleReturnAtCallsite(const CxtStmt& exitCxtStmt,
+                                const FunObjVar* callee, const ICFGNode* callsite,
+                                const std::vector<const ICFGNode*>& successors);
 
     /// Handle intra
-    void handleIntra(const CxtStmt& cts);
+    template<class ICFGGraph, class CGGraph> void handleIntra(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts);
 
     /// Handle call relations
-    void handleCallRelation(CxtLockProc& clp, const CallGraphEdge* cgEdge, const CallICFGNode* call);
+    template<class ICFGGraph, class CGGraph> void handleCallRelation(ICFGGraph icfg, CGGraph cg, CxtLockProc& clp, const CallGraphEdge* cgEdge, const CallICFGNode* call);
 
     /// Return true it a lock matches an unlock
     bool isAliasedLocks(const CxtLock& cl1, const CxtLock& cl2)
     {
         return isAliasedLocks(cl1.getStmt(), cl2.getStmt());
     }
-    bool isAliasedLocks(const ICFGNode* i1, const ICFGNode* i2)
-    {
-        /// todo: must alias
-        return tct->getPTA()->alias(getLockVal(i1)->getId(), getLockVal(i2)->getId());
-    }
+    bool isAliasedLocks(const ICFGNode* i1, const ICFGNode* i2);
 
     /// Mark thread flags for cxtStmt
     //@{
     /// Transfer function for marking context-sensitive statement
     void markCxtStmtFlag(const CxtStmt& tgr, const CxtStmt& src)
     {
-        const CxtLockSet& srclockset = getCxtLockfromCxtStmt(src);
-        if(hasCxtLockfromCxtStmt(tgr)== false)
+        const CxtLockSet& srclockset = getCxtLockFromCxtStmt(src);
+        if(hasCxtLockFromCxtStmt(tgr)== false)
         {
             for(CxtLockSet::const_iterator it = srclockset.begin(), eit = srclockset.end(); it!=eit; ++it)
             {
@@ -366,23 +417,26 @@ private:
         }
         else
         {
-            if(intersect(getCxtLockfromCxtStmt(tgr),srclockset))
+            if(intersect(getCxtLockFromCxtStmt(tgr),srclockset))
+            {
                 pushToCTSWorkList(tgr);
+            }
         }
     }
     bool intersect(CxtLockSet& tgrlockset, const CxtLockSet& srclockset)
     {
-        CxtLockSet toBeDeleted;
-        for(CxtLockSet::const_iterator it = tgrlockset.begin(), eit = tgrlockset.end(); it!=eit; ++it)
+        bool changed = false;
+        for (CxtLockSet::iterator it = tgrlockset.begin(); it != tgrlockset.end(); )
         {
-            if(srclockset.find(*it)==srclockset.end())
-                toBeDeleted.insert(*it);
+            if (srclockset.find(*it) == srclockset.end())
+            {
+                it = tgrlockset.erase(it);
+                changed = true;
+            }
+            else
+                ++it;
         }
-        for(CxtLockSet::const_iterator it = toBeDeleted.begin(), eit = toBeDeleted.end(); it!=eit; ++it)
-        {
-            tgrlockset.erase(*it);
-        }
-        return !toBeDeleted.empty();
+        return changed;
     }
 
     /// Clear flags
@@ -488,14 +542,16 @@ private:
     /// Map a statement to all its context-sensitive statements
     InstToCxtStmtSet instToCxtStmtSet;
 
+    /// Incremental exact suffix index for contexts observed at callsites.
+    InstToContextSuffixMap callsiteContextSuffixIndex;
 
     /// Context-sensitive locks
-    CxtLockSet cxtLockset;
+    CxtLockSet cxtLockSet;
 
     /// Map a context-sensitive lock to its lock span statements
     /// Map a context-sensitive statement to its context-sensitive lock
     //@{
-    CxtLockToSpan cxtLocktoSpan;
+    CxtLockToSpan cxtLockToSpan;
     CxtStmtToCxtLockSet cxtStmtToCxtLockSet;
     //@}
 
@@ -507,22 +563,21 @@ private:
 
     /// Collecting lock/unlock sites
     //@{
-    InstSet locksites;
-    InstSet unlocksites;
+    InstSet lockSites;
+    InstSet unlockSites;
     //@}
 
     /// Candidate functions which relevant to locks/unlocks
     //@{
-    FunSet lockcandidateFuncSet;
+    FunSet lockCandidateFuncSet;
     //@}
 
     /// Used for context-insensitive intra-procedural locks
     //@{
-    CILockToSpan ciLocktoSpan;
+    CILockToSpan ciLockToSpan;
     InstToInstSetMap instCILocksMap;
-    InstToInstSetMap instTocondCILocksMap;
+    InstToInstSetMap instToCondCILocksMap;
     //@}
-
 
 public:
     double lockTime;

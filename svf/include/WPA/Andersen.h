@@ -43,6 +43,8 @@
 #include "Util/GeneralType.h"
 #include "Util/Options.h"
 
+#include <optional>
+
 namespace SVF
 {
 
@@ -252,6 +254,9 @@ public:
         return getPTDataTy()->unionPts(id,ptd);
     }
 
+    /// Collect exactly the SVFIR nodes q for which mayAlias(node, q) holds
+    virtual NodeBS getMayAliases(NodeID node);
+
 
     void dumpTopLevelPtsTo();
 
@@ -353,6 +358,13 @@ protected:
 
     /// SCC detection
     virtual NodeStack& SCCDetect();
+
+    /// Answer a may-alias query from the reverse points-to sets. Returns nullopt
+    /// when those sets cannot answer it, leaving the caller to try every node.
+    std::optional<NodeBS> collectMayAliasesFromIndex(const PointsTo& expandedPts);
+
+    /// Also check getMayAliases on the pointers that the alias tests use
+    virtual void validateSuccessTests(std::string fun);
 
 
 

@@ -22,7 +22,7 @@ jobs:
             sanitizer: address
     steps:
       # checkout the repo
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       # setup the environment
       - name: mac-setup
         if: runner.os == 'macOS'
@@ -62,10 +62,15 @@ jobs:
         run:
           ctest -R wpa_tests -VV
 
-      - name: ctest dvf and mta
+      - name: ctest dvf
         working-directory: ${{github.workspace}}/Release-build
         run:
           ctest -R dvf_tests -VV
+
+      - name: ctest mta
+        working-directory: ${{github.workspace}}/Release-build
+        run:
+          ctest -R mta_tests -VV
 
       - name: ctest andersen differential analysis
         working-directory: ${{github.workspace}}/Release-build
@@ -162,7 +167,7 @@ jobs:
 
       - name: upload-coverage
         if: runner.os == 'Linux'
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: coverage.info
           verbose: true

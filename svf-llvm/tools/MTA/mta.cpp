@@ -23,31 +23,70 @@
 #include "SVF-LLVM/LLVMUtil.h"
 #include "SVF-LLVM/SVFIRBuilder.h"
 #include "MTA/MTA.h"
+#include "MTA/MTAStat.h"
 #include "Util/CommandLine.h"
 #include "Util/Options.h"
+
+#include <string>
+#include <vector>
 
 using namespace llvm;
 using namespace std;
 using namespace SVF;
 
-int main(int argc, char ** argv)
+namespace
 {
 
-    std::vector<std::string> moduleNameVec;
-    moduleNameVec = OptionBase::parseOptions(
-                        argc, argv, "MTA Analysis", "[options] <input-bitcode...>"
-                    );
+AndersenWaveDiff* preparePreAnalysis(
+    SVFIR* pag, SVFIRBuilder& builder)
+{
+    ScopedPhaseTimer timer("Andersen's pointer analysis");
+
+    AndersenWaveDiff* preAnalysis =
+        AndersenWaveDiff::createAndersenWaveDiff(pag);
+    if (Options::DumpMTAGraphs())
+    {
+        preAnalysis->getConstraintGraph()->dump("original_consg");
+        preAnalysis->getCallGraph()->dump("original_tcg");
+    }
+    builder.updateCallGraph(preAnalysis->getCallGraph());
+    pag->getICFG()->updateCallGraph(preAnalysis->getCallGraph());
+    if (Options::DumpMTAGraphs())
+        pag->getICFG()->dump("original_icfg");
+
+    return preAnalysis;
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    std::vector<std::string> moduleNameVec = OptionBase::parseOptions(
+                argc, argv, "MTA Analysis", "[options] <input-bitcode...>");
 
     LLVMModuleSet::buildSVFModule(moduleNameVec);
     SVFIRBuilder builder;
     SVFIR* pag = builder.build();
 
+    // MTA's only client is race detection. -mta-flow-sensitive (default) selects the
+    // FSAM pipeline (SlicedMTA), which decides slicing and the pre-analysis
+    // context handling internally; otherwise run the flow-insensitive Andersen
+    // detector.
+    bool succeeded = true;
+    if (Options::MTFlowSensitive())
+    {
+        AndersenWaveDiff* preAnalysis = preparePreAnalysis(pag, builder);
+        SlicedMTA sliced;
+        succeeded = sliced.runOnModule(pag, *preAnalysis);
+    }
+    else
+    {
+        MTA mta;
+        succeeded = !mta.runOnModule(pag);
+    }
 
-    MTA mta;
-    mta.runOnModule(pag);
-
+    AndersenWaveDiff::releaseAndersenWaveDiff();
+    SVFIR::releaseSVFIR();
     LLVMModuleSet::releaseLLVMModuleSet();
-
-
-    return 0;
+    return succeeded ? 0 : 1;
 }

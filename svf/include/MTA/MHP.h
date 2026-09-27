@@ -33,11 +33,16 @@
 #include "MTA/TCT.h"
 #include "Util/SVFUtil.h"
 
+#include <memory>
+#include <vector>
+
 namespace SVF
 {
 
 class ForkJoinAnalysis;
 class LockAnalysis;
+// Forward declaration for the sliced-graph handle analyze() can run on.
+class SlicedSVFIRView;
 
 /*!
  * This class serves as a base may-happen in parallel analysis for multithreaded program
@@ -52,6 +57,17 @@ public:
     typedef Set<CxtThreadStmt> CxtThreadStmtSet;
     typedef Map<CxtThreadStmt,NodeBS> ThreadStmtToThreadInterleav;
     typedef Map<const ICFGNode*,CxtThreadStmtSet> InstToThreadStmtSetMap;
+    /// Query-only exact compression of the context-sensitive fixed point.
+    /// For one ICFG node, interleavingByTid[t] is the union of the
+    /// interleaving sets of every calling context in which thread t reaches
+    /// the node. MHP's existential context-pair query factors exactly through
+    /// these per-tid unions (see mayHappenInParallelInst).
+    struct NodeThreadSummary
+    {
+        NodeBS tids;
+        Map<NodeID, NodeBS> interleavingByTid;
+    };
+    typedef Map<const ICFGNode*, NodeThreadSummary> InstToThreadSummaryMap;
     typedef SVFLoopAndDomInfo::LoopBBs LoopBBs;
 
     typedef Set<CxtStmt> LockSpan;
@@ -59,17 +75,30 @@ public:
     typedef std::pair<const FunObjVar*,const FunObjVar*> FuncPair;
     typedef Map<FuncPair, bool> FuncPairToBool;
 
-    /// Constructor
-    MHP(TCT* t);
+    enum class StateRepresentation
+    {
+        MaterializedContexts,
+        QuerySummaries
+    };
+
+    /// Construct MHP and initialize its graph-dependent ForkJoinAnalysis.
+    template<class ICFGGraph, class CGGraph>
+    static std::unique_ptr<MHP> create(
+        TCT* t, ICFGGraph icfg, CGGraph cg,
+        StateRepresentation representation = StateRepresentation::MaterializedContexts);
 
     /// Destructor
     virtual ~MHP();
 
-    /// Start analysis here
-    void analyze();
+    /// Start analysis here. One implementation for the whole program and a
+    /// slice: the compute is templated on the two graphs it traverses -- the ICFG
+    /// (ICFG* whole / const SlicedICFGView* sliced) and the CallGraph (CallGraph*
+    /// whole / const SlicedThreadCallGraphView* sliced) -- and calls their
+    /// GenericGraphTraits specialisations directly (no wrapper layer).
+    template<class ICFGGraph, class CGGraph> void analyze(ICFGGraph icfg, CGGraph cg);
 
     /// Analyze thread interleaving
-    void analyzeInterleaving();
+    template<class ICFGGraph, class CGGraph> void analyzeInterleaving(ICFGGraph icfg, CGGraph cg);
 
     /// Get ThreadCallGraph
     inline ThreadCallGraph* getThreadCallGraph() const
@@ -86,12 +115,15 @@ public:
     /// Whether the function is connected from main function in thread call graph
     bool isConnectedfromMain(const FunObjVar* fun);
 
-//    LockSpan getSpanfromCxtLock(NodeID l);
     /// Interface to query whether two instructions may happen-in-parallel
     virtual bool mayHappenInParallel(const ICFGNode* i1, const ICFGNode* i2);
     virtual bool mayHappenInParallelCache(const ICFGNode* i1, const ICFGNode* i2);
     virtual bool mayHappenInParallelInst(const ICFGNode* i1, const ICFGNode* i2);
     virtual bool executedByTheSameThread(const ICFGNode* i1, const ICFGNode* i2);
+
+    /// Representation-independent per-thread summary used by MHP clients.
+    /// Available after analyze() in both materialized and summary-only modes.
+    const NodeThreadSummary* getThreadSummary(const ICFGNode* inst) const;
 
     /// Get interleaving thread for statement inst
     //@{
@@ -122,34 +154,49 @@ public:
     /// Print interleaving results
     void printInterleaving();
 
-private:
+protected:
+    /// Construction is paired with ForkJoinAnalysis initialization by create().
+    /// @param representation Keep per-context copies
+    /// for clients that enumerate raw states (the pre-analysis detector and
+    /// slicer). Main-phase clients issue only MHP queries and can use the exact
+    /// projected query summary instead.
+    explicit MHP(
+        TCT* t,
+        StateRepresentation representation = StateRepresentation::MaterializedContexts);
 
-    inline const CallGraph::FunctionSet& getCallee(const CallICFGNode* inst, CallGraph::FunctionSet& callees)
-    {
-        tcg->getCallees(inst, callees);
-        return callees;
-    }
     /// Update non-candidate functions' interleaving.
     /// Copy interleaving threads of the entry inst to other insts.
-    void updateNonCandidateFunInterleaving();
+    template<class ICFGGraph, class CGGraph> void updateNonCandidateFunInterleaving(ICFGGraph icfg, CGGraph cg);
 
+    /// Build the exact, context-compressed representation used by repeated MHP
+    /// queries after the context-sensitive fixed point has converged.
+    template<class ICFGGraph, class CGGraph> void buildQuerySummaries(ICFGGraph icfg, CGGraph cg);
     /// Handle non-candidate function
-    void handleNonCandidateFun(const CxtThreadStmt& cts);
+    template<class ICFGGraph, class CGGraph> void handleNonCandidateFun(ICFGGraph icfg, CGGraph cg, const CxtThreadStmt& cts);
 
     /// Handle fork
-    void handleFork(const CxtThreadStmt& cts, NodeID rootTid);
+    template<class ICFGGraph, class CGGraph> void handleFork(ICFGGraph icfg, CGGraph cg, const CxtThreadStmt& cts, NodeID rootTid);
 
     /// Handle join
-    void handleJoin(const CxtThreadStmt& cts, NodeID rootTid);
+    template<class ICFGGraph, class CGGraph> void handleJoin(ICFGGraph icfg, CGGraph cg, const CxtThreadStmt& cts, NodeID rootTid);
 
     /// Handle call
-    void handleCall(const CxtThreadStmt& cts, NodeID rootTid);
+    template<class ICFGGraph, class CGGraph> void handleCall(ICFGGraph icfg, CGGraph cg, const CxtThreadStmt& cts, NodeID rootTid);
 
     /// Handle return
-    void handleRet(const CxtThreadStmt& cts);
+    template<class ICFGGraph, class CGGraph> void handleRet(ICFGGraph icfg, CGGraph cg, const CxtThreadStmt& cts);
 
     /// Handle intra
-    void handleIntra(const CxtThreadStmt& cts);
+    template<class ICFGGraph, class CGGraph> void handleIntra(ICFGGraph icfg, CGGraph cg, const CxtThreadStmt& cts);
+
+    /// Symmetric-join loop-exit kills, applied to EDGE flows (node states stay
+    /// pure unions, so paths bypassing the join keep their interleavings).
+    //@{
+    typedef Map<const SVFBasicBlock*, std::vector<CxtStmt>> BBToSymJoinsMap;
+    typedef Map<CxtStmt, Set<const SVFBasicBlock*>> SymJoinToLoopMap;
+    void buildSymJoinKillTables();
+    NodeBS edgeFlow(const CxtThreadStmt& cts, const ICFGNode* dst);
+    //@}
 
     /// Add/Remove interleaving thread for statement inst
     //@{
@@ -164,6 +211,15 @@ private:
     inline void addInterleavingThread(const CxtThreadStmt& tgr, const CxtThreadStmt& src)
     {
         bool changed = threadStmtToThreadInterLeav[tgr] |= threadStmtToThreadInterLeav[src];
+        if(changed)
+        {
+            instToTSMap[tgr.getStmt()].insert(tgr);
+            pushToCTSWorkList(tgr);
+        }
+    }
+    inline void addInterleavingBits(const CxtThreadStmt& tgr, const NodeBS& bits)
+    {
+        bool changed = threadStmtToThreadInterLeav[tgr] |= bits;
         if(changed)
         {
             instToTSMap[tgr.getStmt()].insert(tgr);
@@ -187,8 +243,8 @@ private:
 
     /// Update Ancestor and sibling threads
     //@{
-    void updateAncestorThreads(NodeID tid);
-    void updateSiblingThreads(NodeID tid);
+    template<class ICFGGraph, class CGGraph> void updateAncestorThreads(ICFGGraph icfg, CGGraph cg, NodeID tid);
+    template<class ICFGGraph, class CGGraph> void updateSiblingThreads(ICFGGraph icfg, CGGraph cg, NodeID tid);
     //@}
 
     /// Thread curTid can be fully joined by parentTid recursively
@@ -267,9 +323,13 @@ private:
     ForkJoinAnalysis* fja;				///< ForJoin Analysis
     CxtThreadStmtWorkList cxtStmtList;	///< CxtThreadStmt worklist
     ThreadStmtToThreadInterleav threadStmtToThreadInterLeav; /// Map a statement to its thread interleavings
+    BBToSymJoinsMap bbToSymJoins;   ///< loop block -> symmetric in-loop joins of that loop
+    SymJoinToLoopMap symJoinLoop;   ///< symmetric in-loop join -> its loop's blocks
     InstToThreadStmtSetMap instToTSMap; ///< Map an instruction to its ThreadStmtSet
+    InstToThreadSummaryMap instToThreadSummary; ///< Exact per-node/per-tid query compression
+    Map<const ICFGNode*, const ICFGNode*> querySummaryOwner; ///< Non-candidate node -> entry summary
+    StateRepresentation stateRepresentation;
     FuncPairToBool nonCandidateFuncMHPRelMap;
-
 
 public:
     u32_t numOfTotalQueries;		///< Total number of queries
@@ -277,8 +337,6 @@ public:
     double interleavingTime;
     double interleavingQueriesTime;
 };
-
-
 
 /*!
  *
@@ -306,7 +364,6 @@ public:
     typedef Set<CxtStmt> CxtStmtSet;
     typedef Map<const ICFGNode*, CxtStmtSet> InstToCxtStmt;
 
-
     ForkJoinAnalysis(TCT* t) : tct(t)
     {
         collectSCEVInfo();
@@ -317,7 +374,8 @@ public:
     /// context-sensitive forward traversal from each fork site. Generate following results
     /// (1) fork join pair, maps a context-sensitive join site to its corresponding thread ids
     /// (2) never happen-in-parallel thread pairs
-    void analyzeForkJoinPair();
+    template<class ICFGGraph, class CGGraph>
+    void analyzeForkJoinPair(ICFGGraph icfg, CGGraph cg);
 
     /// Get directly joined threadIDs based on a context-sensitive join site
     inline NodeBS& getDirectlyJoinedTid(const CxtStmt& cs)
@@ -363,22 +421,35 @@ public:
     {
         return tct->hasJoinLoop(inst);
     }
+    /// All SCEV-symmetric in-loop joins and their loop blocks.
+    inline const CxtStmtToLoopMap& getSymmetricLoopJoins() const
+    {
+        return cxtJoinInLoop;
+    }
 private:
 
     /// Handle fork
-    void handleFork(const CxtStmt& cts,NodeID rootTid);
+    template<class ICFGGraph, class CGGraph>
+    void handleFork(ICFGGraph icfg, CGGraph cg,
+                    const CxtStmt& cts, NodeID rootTid);
 
     /// Handle join
-    void handleJoin(const CxtStmt& cts,NodeID rootTid);
+    template<class ICFGGraph, class CGGraph>
+    void handleJoin(ICFGGraph icfg, CGGraph cg,
+                    const CxtStmt& cts, NodeID rootTid);
 
     /// Handle call
-    void handleCall(const CxtStmt& cts,NodeID rootTid);
+    template<class ICFGGraph, class CGGraph>
+    void handleCall(ICFGGraph icfg, CGGraph cg,
+                    const CxtStmt& cts);
 
     /// Handle return
-    void handleRet(const CxtStmt& cts);
+    template<class ICFGGraph, class CGGraph>
+    void handleRet(ICFGGraph icfg, CGGraph cg, const CxtStmt& cts);
 
     /// Handle intra
-    void handleIntra(const CxtStmt& cts);
+    template<class ICFGGraph>
+    void handleIntra(ICFGGraph icfg, const CxtStmt& cts);
 
     /// Return true if the fork and join have the same SCEV
     bool isSameSCEV(const ICFGNode* forkSite, const ICFGNode* joinSite);
@@ -387,10 +458,8 @@ private:
     bool sameLoopTripCount(const ICFGNode* forkSite, const ICFGNode* joinSite);
 
     /// Whether it is a matched fork join pair
-    bool isAliasedForkJoin(const CallICFGNode* forkSite, const CallICFGNode* joinSite)
-    {
-        return tct->getPTA()->alias(getForkedThread(forkSite)->getId(), getJoinedThread(joinSite)->getId());
-    }
+    bool isAliasedForkJoin(const CallICFGNode* forkSite, const CallICFGNode* joinSite);
+    ThreadAPI::ForkJoinAliasCache forkJoinAliasCache;
     /// Mark thread flags for cxtStmt
     //@{
     /// Get the flag for a cxtStmt
@@ -506,11 +575,6 @@ private:
     {
         return getTCG()->getThreadAPI()->getJoinedThread(call);
     }
-    inline const CallGraph::FunctionSet& getCallee(const ICFGNode* inst, CallGraph::FunctionSet& callees)
-    {
-        getTCG()->getCallees(SVFUtil::cast<CallICFGNode>(inst), callees);
-        return callees;
-    }
     /// ThreadCallGraph
     inline ThreadCallGraph* getTCG() const
     {
@@ -577,6 +641,16 @@ private:
     ThreadPairSet partialJoin;		///< t1 partially joins t2 along some program path(s)
     InstToCxtStmt instToCxtStmt;    ///<Map a statement to all its context-sensitive statements
 };
+
+template<class ICFGGraph, class CGGraph>
+std::unique_ptr<MHP> MHP::create(
+    TCT* t, ICFGGraph icfg, CGGraph cg, StateRepresentation representation)
+{
+    std::unique_ptr<MHP> mhp(new MHP(t, representation));
+    mhp->fja->analyzeForkJoinPair(icfg, cg);
+    mhp->buildSymJoinKillTables();
+    return mhp;
+}
 
 } // End namespace SVF
 
