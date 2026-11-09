@@ -178,14 +178,23 @@ public:
     IntervalValue getGepByteOffset(const GepStmt* gep);
     AddressValue getGepObjAddrs(const ValVar* pointer, IntervalValue offset);
 
-    /// Virtual so full-sparse can layer the GepObj overlay on top.
+    /// Read memory through the pointer's address targets.
     virtual AbstractValue loadValue(const ValVar* pointer,
                                     const ICFGNode* node);
+
+    /// Shared by all sparsity modes: a strong update replaces one concrete
+    /// cell; a weak update JOINs the old and new values at every possible target.
     virtual void storeValue(const ValVar* pointer, const AbstractValue& val,
                             const ICFGNode* node);
 
     const SVFType* getPointeeElement(const ObjVar* var, const ICFGNode* node);
-    u32_t getAllocaInstByteSize(const AddrStmt* addr);
+    struct AllocationSizeBounds
+    {
+        u32_t lowerBound;
+        u32_t upperBound;
+    };
+
+    AllocationSizeBounds getAllocaInstByteSize(const AddrStmt* addr);
 
     // ---- Direct Trace Access ------------------------------------------
 
@@ -202,6 +211,21 @@ protected:
     /// Factory-only construction.  External callers must use getAEInstance();
     /// `SparseAbstractInterpretation` reaches this via its own ctor.
     AbstractInterpretation();
+
+    /// One abstract address need not denote one concrete cell. Heap allocation
+    /// sites and recursive locals summarize multiple instances and need weak
+    /// updates, just like multi-target pointers and merged fields. A separate
+    /// array element can be strongly updated if elements are modeled separately
+    /// and its address is unique.
+    ///
+    /// state is needed because getIDFromAddr checks its freed-address set,
+    /// not just the address bits. An address recorded as freed resolves to the
+    /// BlackHole Obj and must not receive a strong update.
+    ///
+    ///   int x=1, y=3; p=cond ? &x : &y; *p=2;  // x:[1,2], y:[2,3]
+    ///   a=foo(); b=foo(); // foo returns malloc: a/b may name one heap summary
+    bool isStrongUpdate(const AddressValue& targets,
+                        const AbstractState& state) const;
 
     // ---- Cycle helpers overridden by SparseAbstractInterpretation ----
     // The dense versions write only to trace[cycle_head].  The semi-sparse
@@ -227,29 +251,18 @@ protected:
     /// Pull-based state merge: read abstractTrace[pred] for each predecessor,
     /// apply branch refinement for conditional IntraCFGEdges, and join into
     /// abstractTrace[node]. Returns true if at least one predecessor had state.
-    /// Virtual so full-sparse can layer per-MRSVFGNode obj pulls on top of the
-    /// base ICFG-edge merge.
+    /// FullSparse additionally assembles inputs from direct SVFG predecessors.
     virtual bool mergeStatesFromPredecessors(const ICFGNode* node);
 
     /// Returns true if the branch edge is reachable under the current state.
-    /// Pure query: does not update `as` or branch refinement traces.
+    /// Pure query: does not update abstract states.
     bool isBranchEdgeFeasible(const IntraCFGEdge* edge, AbstractState& as);
 
-    /// Collect branch-induced interval refinement after a feasible edge has
-    /// been selected for normal CFG-state merging.
-    void collectBranchRefinement(const IntraCFGEdge* edge, AbstractState& as);
-
-    /// Hook called by collectBranchRefinement for each obj that the
-    /// branch narrows.  Default (dense/semi): MEET `narrowed` onto
-    /// obj's value (read at `loadIcfg` where sparse keeps it) and
-    /// write the result into the local `as` (per-edge predState copy)
-    /// so joinStates carries it to `succ`.  FullSparse overrides to
-    /// capture into refinementTrace[succ] instead.
-    virtual void recordBranchRefinement(NodeID objId,
-                                        const IntervalValue& narrowed,
-                                        AbstractState& as,
-                                        const ICFGNode* loadIcfg,
-                                        const ICFGNode* succ);
+    /// Derive cmp/switch constraints and apply them to this temporary input.
+    /// Narrow only carried interval Obj values reached through one known
+    /// pointer target, without changing the backing load's trace.
+    /// Return false when a carried value contradicts the selected branch.
+    bool applyBranchRefinement(const IntraCFGEdge* edge, AbstractState& as);
 
 private:
     /// Initialize abstract state for the global ICFG node and process global
@@ -274,9 +287,14 @@ private:
     /// Returns true if the cmp-conditional branch is feasible.
     bool isCmpBranchEdgeFeasible(const IntraCFGEdge* edge, AbstractState& as);
 
-    /// Returns true if the switch branch is feasible.
+    /// Check whether any input value can take this switch edge; do not refine it.
     bool isSwitchBranchEdgeFeasible(const IntraCFGEdge* edge,
-                                    AbstractState& as);
+                                    const IntervalValue& input) const;
+
+    /// True when the edge enters the switch's default destination.
+    /// LLVM provides this destination even without a source-level default.
+    /// Explicit cases may share it; this checks the destination only.
+    bool isSwitchDefaultEdge(const IntraCFGEdge* edge) const;
 
     void updateStateOnAddr(const AddrStmt *addr);
 

@@ -38,6 +38,8 @@
 #include "SVF-LLVM/LLVMModule.h"
 #include "SVF-LLVM/LLVMUtil.h"
 
+#include <optional>
+
 namespace SVF
 {
 
@@ -52,6 +54,99 @@ private:
     SVFIR* pag;
     const SVFBasicBlock* curBB;	///< Current basic block during SVFIR construction when visiting the module
     const Value* curVal;	///< Current Value during SVFIR construction when visiting the module
+
+
+    /// Zero-based indices through nested structs, arrays or fixed vector lanes.
+    /// For {i32, {ptr, ptr}}, {1, 0} selects the first pointer in the inner struct.
+    /// An empty path denotes a scalar pointer leaf during dependency traversal.
+    using AggregateField = std::vector<unsigned>;
+    /// Identify a field by its LLVM value and path, rather than by its type alone.
+    using AggregateFieldKey = std::pair<const Value*, AggregateField>;
+    /// Reuse the same scalar SVFIR node for repeated requests for a field.
+    Map<AggregateFieldKey, NodeID> aggregateFieldNodes;
+
+    bool getAggregateFieldOperands(const AggregateFieldKey& field,
+                                   std::vector<AggregateFieldKey>& operands);
+    bool getAggregateFieldNode(const Value* aggregate, const AggregateField& indices,
+                               NodeID& node);
+    /// Decode a pointer extraction; unsupported instructions have no field.
+    static std::optional<AggregateFieldKey>
+    getExtractedField(const Instruction& inst);
+    void addExtractedFieldCopy(Instruction& inst);
+
+    /*!
+     * Carry a pointer field from a returned aggregate to its extraction.
+     * C example (Clang 21, x86-64 Linux, -O1; noinline preserves the call):
+     *   struct Pair { int *first, *second; };
+     *   __attribute__((noinline))
+     *   struct Pair make(int *p, int *q) { return (struct Pair){p, q}; }
+     *   int *first(int *p, int *q)
+     *   {
+     *       struct Pair a = make(p, q);
+     *       return a.first;
+     *   }
+     * Corresponding LLVM IR (names simplified, attributes omitted):
+     *   define {ptr, ptr} @make(ptr %p, ptr %q) {
+     *     %r0 = insertvalue {ptr, ptr} poison, ptr %p, 0
+     *     %r1 = insertvalue {ptr, ptr} %r0, ptr %q, 1
+     *     ret {ptr, ptr} %r1
+     *   }
+     *   define ptr @first(ptr %p, ptr %q) {
+     *     %a = tail call {ptr, ptr} @make(ptr %p, ptr %q)
+     *     %x = extractvalue {ptr, ptr} %a, 0
+     *     ret ptr %x
+     *   }
+     * Only field {0} is extracted. For this call, the field uses three
+     * distinct SVFIR nodes:
+     *   obj: a pointer-sized DummyObjVar, called the return slot. This is
+     *        synthetic storage, not the Pair object or an LLVM alloca.
+     *   A:   a DummyValVar pointing to obj, passed to make.
+     *   V:   a DummyValVar holding the pointer loaded from obj after the
+     *        call; later uses read V without reloading obj.
+     * Each static callsite has its own obj/A/V for each demanded field.
+     * make also gets a synthetic output ArgValVar, named out_obj below.
+     * Using symbolic node names, the field transport is shown below; ordinary
+     * argument/return edges and whole-aggregate fallback edges are omitted:
+     *   first's call:  A = Addr(obj)
+     *   make's entry:  CallPE(A, out_obj)
+     *   make's %r0:    F0 = Copy(%p)
+     *   make's %r1:    F1 = Copy(F0)
+     *   make's return: Store(F1, out_obj)
+     *   first's %x:    V = Load(A); %x = Copy(V)
+     * insertvalue creates a new aggregate: %r0 = {%p, poison},
+     * %r1 = {%p, %q}. The second insertion preserves field {0}.
+     * F0 models (%r0, {0}) and F1 models (%r1, {0}); field {1} is not
+     * extracted here, so it needs no separate field node.
+     * The snapshot load precedes the extraction copy at the same continuation.
+     * aggregateReturnParams[make][{0}] holds out_obj.
+     * aggregateCallArgs[%a][{0}] holds A, and
+     * aggregateFieldNodes[(%a, {0})] holds V. obj, Addr(obj) and
+     * Load(A) are created before instructions are visited; V is loaded at %x,
+     * the instruction after the call.
+     * All calls to make append their own A to match out_obj, even with unused
+     * results. More demanded fields follow field-path order. These additions
+     * affect only SVFIR; the LLVM signatures above do not change.
+     */
+    /// Output parameters of each modeled callee, in field-path order.
+    Map<const Function*, std::map<AggregateField, NodeID>> aggregateReturnParams;
+    /// Slot addresses that each call to a modeled callee passes as output
+    /// arguments, in field-path order, including calls with unused results.
+    /// visitCallSite appends them after the call's ordinary arguments.
+    Map<const CallInst*, std::map<AggregateField, NodeID>> aggregateCallArgs;
+
+    /// Field paths extracted from each callee's returned aggregate.
+    using AggregateReturnFields =
+        Map<const Function*, std::set<AggregateField>>;
+
+    void initialiseAggregateReturns();
+    AggregateReturnFields discoverAggregateReturnFields();
+    void createAggregateReturnParams(const Function* fun,
+                                     const std::set<AggregateField>& fields,
+                                     const SVFType* pointerType);
+    void createAggregateCallSlots(const Function* fun,
+                                  const SVFType* pointerType);
+    void addAggregateCallFields(const CallInst* call);
+    void addAggregateReturnStores(ReturnInst& inst);
 
 public:
     /// Constructor
@@ -142,6 +237,9 @@ public:
     void visitExtractValueInst(ExtractValueInst  &EVI);
     void visitBranchInst(BranchInst &I);
     void visitSwitchInst(SwitchInst &I);
+    /// Keep the whole aggregate defined for full-SVFG consumers.
+    /// getAggregateFieldNode models demanded pointer fields separately;
+    /// those definitions do not read this fallback.
     void visitInsertValueInst(InsertValueInst &I)
     {
         addBlackHoleAddrEdge(getValueNode(&I));
@@ -168,6 +266,9 @@ public:
 
     void visitExtractElementInst(ExtractElementInst &I);
 
+    /// Keep the whole vector defined for full-SVFG consumers.
+    /// getAggregateFieldNode models supported pointer lanes separately;
+    /// those definitions do not read this fallback.
     void visitInsertElementInst(InsertElementInst &I)
     {
         addBlackHoleAddrEdge(getValueNode(&I));

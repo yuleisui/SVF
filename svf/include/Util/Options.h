@@ -96,6 +96,7 @@ public:
 
     // Program Assignment Graph for pointer analysis (SVFIR.cpp)
     static Option<bool> HandBlackHole;
+    static const Option<bool> UndefAsNull;
     static const Option<bool> FirstFieldEqBase;
 
     // SVFG optimizer (SVFGOPT.cpp)
@@ -105,6 +106,7 @@ public:
 
     // Sparse value-flow graph (VFG.cpp)
     static const Option<bool> DumpVFG;
+    static const Option<bool> DumpSparseObjGraph;
 
     // Base class of pointer analyses (PointerAnalysis.cpp)
     static const Option<bool> TypePrint;

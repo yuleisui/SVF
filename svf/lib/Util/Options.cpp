@@ -57,7 +57,7 @@ const OptionMap<PTBackingType> Options::ptDataBacking(
 
 const Option<u32_t> Options::FsTimeLimit(
     "fs-time-limit",
-    "time limit for main phase of flow-sensitive analyses",
+    "time limit for main phase of flow-sensitive analyses (0 = no timer)",
     0
 );
 
@@ -69,7 +69,7 @@ const Option<u32_t> Options::VersioningThreads(
 
 const Option<u32_t> Options::AnderTimeLimit(
     "ander-time-limit",
-    "time limit for Andersen's analyses (ignored when -fs-time-limit set)",
+    "time limit for Andersen's analyses (erroneous to set when -fs-time-limit is; 0 = no timer)",
     0
 );
 
@@ -168,6 +168,13 @@ Option<bool> Options::HandBlackHole(
     false
 );
 
+const Option<bool> Options::UndefAsNull(
+    "undef-as-null",
+    "Map pointer-typed undef and poison to the null node "
+    "(opt-in points-to approximation; unsuitable for abstract execution)",
+    false
+);
+
 const Option<bool> Options::FirstFieldEqBase(
     "ff-eq-base",
     "Treat base objects as their first fields",
@@ -199,6 +206,11 @@ const Option<std::string> Options::SelfCycle(
 const Option<bool> Options::DumpVFG(
     "dump-vfg",
     "Dump dot graph of VFG",
+    false
+);
+const Option<bool> Options::DumpSparseObjGraph(
+    "dump-sparse-obj-graph",
+    "Dump object routes to sparse_obj_graph.dot when a full SVFG is built",
     false
 );
 

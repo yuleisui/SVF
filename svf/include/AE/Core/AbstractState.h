@@ -49,6 +49,7 @@
 #include "AE/Core/AbstractValue.h"
 #include "AE/Core/IntervalValue.h"
 #include "Util/GeneralType.h"
+#include <algorithm>
 
 namespace SVF
 {
@@ -139,11 +140,13 @@ public:
 
     static inline bool isNullMem(u32_t addr)
     {
+        assert(isVirtualMemAddress(addr) && "needs to be a virtual memory address");
         return addr == NullMemAddr;
     }
 
     static inline bool isBlackHoleObjAddr(u32_t addr)
     {
+        assert(isVirtualMemAddress(addr) && "needs to be a virtual memory address");
         return addr == BlackHoleObjAddr;
     }
 
@@ -332,7 +335,8 @@ public:
     bool operator==(const AbstractState&rhs) const
     {
         return  eqVarToValMap(_varToAbsVal, rhs.getVarToVal()) &&
-                eqVarToValMap(_addrToAbsVal, rhs.getLocToVal());
+                eqVarToValMap(_addrToAbsVal, rhs.getLocToVal()) &&
+                _freedAddrs == rhs._freedAddrs;
     }
 
     bool operator!=(const AbstractState&rhs) const
@@ -347,7 +351,13 @@ public:
 
     bool operator>=(const AbstractState&rhs) const
     {
-        return geqVarToValMap(_varToAbsVal, rhs.getVarToVal()) && geqVarToValMap(_addrToAbsVal, rhs.getLocToVal());
+        return geqVarToValMap(_varToAbsVal, rhs.getVarToVal()) &&
+               geqVarToValMap(_addrToAbsVal, rhs.getLocToVal()) &&
+               std::all_of(rhs._freedAddrs.begin(), rhs._freedAddrs.end(),
+                           [this](NodeID addr)
+        {
+            return _freedAddrs.count(addr) != 0;
+        });
     }
 
     void clear()

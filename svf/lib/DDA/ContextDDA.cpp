@@ -266,7 +266,7 @@ bool ContextDDA::handleBKCondition(CxtLocDPItem& dpm, const SVFGEdge* edge)
             if(isEdgeInRecursion(csId))
             {
                 DBOUT(DDDA,outs() << "\t\t call edge " << getCallGraph()->getCallerOfCallSite(csId)->getName() <<
-                      "=>" << getCallGraph()->getCalleeOfCallSite(csId)->getName() << "in recursion \n");
+                                     "=>" << getCallGraph()->getCalleeOfCallSite(csId)->getName() << "in recursion \n");
                 popRecursiveCallSites(dpm);
             }
             else
@@ -294,7 +294,7 @@ bool ContextDDA::handleBKCondition(CxtLocDPItem& dpm, const SVFGEdge* edge)
             if(isEdgeInRecursion(csId))
             {
                 DBOUT(DDDA,outs() << "\t\t return edge " << getCallGraph()->getCalleeOfCallSite(csId)->getName() <<
-                      "=>" << getCallGraph()->getCallerOfCallSite(csId)->getName() << "in recursion \n");
+                                     "=>" << getCallGraph()->getCallerOfCallSite(csId)->getName() << "in recursion \n");
                 popRecursiveCallSites(dpm);
             }
             else
@@ -340,7 +340,7 @@ bool ContextDDA::isHeapCondMemObj(const CxtVar& var, const StoreSVFGNode*)
     assert(baseVar && "base object is null??");
     if (SVFUtil::isa<HeapObjVar, DummyObjVar>(baseVar))
     {
-        if (!isa<DummyObjVar>(baseVar))
+        if (isa<DummyObjVar>(baseVar))
         {
             const SVFVar* pnode = _pag->getSVFVar(getPtrNodeID(var));
             const GepObjVar* gepobj = SVFUtil::dyn_cast<GepObjVar>(pnode);

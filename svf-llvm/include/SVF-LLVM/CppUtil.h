@@ -51,8 +51,45 @@ struct DemangledName
     bool isThunkFunc;
 };
 
-struct DemangledName demangle(const std::string& name);
+class CXXABI
+{
+public:
+    virtual ~CXXABI() = default;
+    virtual bool isVtable(const std::string& name) = 0;
+    virtual bool isTypeInfo(const std::string& name) = 0;
+    virtual bool isConstructor(const std::string& name) = 0;
+    virtual bool isDestructor(const std::string& name) = 0;
+    virtual std::string extractClassName(const std::string& name) = 0;
+    virtual DemangledName demangle(const std::string& name) = 0;
+};
 
+class ItaniumABI : public CXXABI
+{
+public:
+    bool isVtable(const std::string& name) override;
+    bool isTypeInfo(const std::string& name) override;
+    bool isConstructor(const std::string& name) override;
+    bool isDestructor(const std::string& name) override;
+    std::string extractClassName(const std::string& name) override;
+    DemangledName demangle(const std::string& name) override;
+};
+
+class MSVCABI : public CXXABI
+{
+public:
+    bool isVtable(const std::string& name) override;
+    bool isTypeInfo(const std::string& name) override;
+    bool isConstructor(const std::string& name) override;
+    bool isDestructor(const std::string& name) override;
+    std::string extractClassName(const std::string& name) override;
+    DemangledName demangle(const std::string& name) override;
+};
+
+CXXABI* getCXXABI();
+CXXABI* getCXXABI(const Module* M);
+CXXABI* getCXXABI(const Value* val);
+
+struct DemangledName demangle(const std::string& name);
 
 Set<std::string> getClsNamesInBrackets(const std::string& name);
 
@@ -79,9 +116,13 @@ std::string getClassNameFromVtblObj(const std::string& vtblName);
  *    { { [4 x i8*] }, [32 x i8] }
  *
  *  See https://github.com/SVF-tools/SVF/issues/1114 for more.
+ *
+ *  Flat arrays are returned in a synthetic struct without changing the global.
+ *  Returns nullptr for declarations or unsupported initializer layouts.
  */
 const ConstantStruct *getVtblStruct(const GlobalValue *vtbl);
 
+/// A carefully crafted input such as `FakeVTable _ZTV1A = {{nullptr, nullptr}};` can forge a vtable; detection is approximate and heuristic.
 bool isValVtbl(const Value* val);
 bool isVirtualCallSite(const CallBase* cs);
 bool isConstructor(const Function* F);
